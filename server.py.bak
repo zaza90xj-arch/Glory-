@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ============================================================
+# SPIDER — مركز التحكم
+# المطور: MODYXBOT
+# Python + بوت تلجرام + دفع بنجوم تلجرام
+# ============================================================
+
+import os
+import json
+import time
+import secrets
+import logging
+import threading
+from pathlib import Path
+from functools import wraps
+
+from flask import Flask, request, jsonify, send_from_directory
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    PreCheckoutQueryHandler, MessageHandler, filters, ContextTypes
+)
+
+# ============================================================
+# ⚙️  الإعدادات — عدّل من هنا فقط
+# ============================================================
+CONFIG = {
+    "PORT": 3000,
+    "DEVELOPER": "MODYXBOT",
+
+    # تلجرام
+    "BOT_TOKEN": "8989530492:AAExbi2K5JHmIMOxdB-bn5JZQqq1wYVrztk",   # ← حط توكن البوت
+    "ADMIN_CHAT_ID": 6397469050,                                 # ← حط chat id بتاعك
+    "BOT_USERNAME": "MODY CODX",                        # ← اسم البوت بدون @
+
+    # إعدادات الأكواد
+    "CODE_PREFIX": "SPX-",
+    "CODE_LENGTH": 16,
+    "DEFAULT_MAX_USES": 1,
+    "DEFAULT_TTL_DAYS": 7,
+
+    # الباقات (بالنجوم) — كلها بالعربي
+    "PACKAGES": {
+        "weekly":    {"name": "باقة أسبوعية",   "stars": 100, "days": 7,   "uses": 1, "desc": "كود صالح لمدة أسبوع كامل"},
+        "monthly":   {"name": "باقة شهرية",     "stars": 300, "days": 30,  "uses": 1, "desc": "كود صالح لمدة شهر كامل"},
+        "quarterly": {"name": "باقة 3 شهور",    "stars": 750, "days": 90,  "uses": 1, "desc": "كود صالح لمدة 3 شهور"},
+        "team":      {"name": "باقة الفريق",    "stars": 500, "days": 30,  "uses": 4, "desc": "4 أكواد لمدة شهر — لفريق كامل"},
+    },
+
+    # مسارات
+    "BASE_DIR": Path(__file__).parent,
+    "DATA_DIR": Path(__file__).parent / "data",
+    "PUBLIC_DIR": Path(__file__).parent / "public",
+}
+
+CONFIG["DATA_DIR"].mkdir(exist_ok=True)
+CONFIG["PUBLIC_DIR"].mkdir(exist_ok=True)
+
+CODES_FILE    = CONFIG["DATA_DIR"] / "codes.json"
+SESSIONS_FILE = CONFIG["DATA_DIR"] / "sessions.json"
+SALES_FILE    = CONFIG["DATA_DIR"] / "sales.json"
+
+# ============================================================
+# أدوات مساعدة
+# ============================================================
+def read_json(path, fallback):
+    try:
+        if not path.exists(): return fallback
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return fallback
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def now_ms():
+    return int(time.time() * 1000)
+
+def gen_code():
+    raw = secrets.token_hex(CONFIG["CODE_LENGTH"] // 2).upper()
+    return CONFIG["CODE_PREFIX"] + raw
+
+# ============================================================
+# Flask App
+# ============================================================
+app = Flask(__name__, static_folder=str(CONFIG["PUBLIC_DIR"]), static_url_path="")
+app.secret_key = secrets.token_hex(32)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("SPIDER")
+
+START_TIME = time.time()
+
+# ============================================================
+# API — الدخول والجلسات
+# ============================================================
+def require_session(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("x-session") or request.args.get("token")
+        sessions = read_json(SESSIONS_FILE, {})
+        s = sessions.get(token)
+        if not s or s.get("expires", 0) < now_ms():
+            return jsonify({"status": "error", "error": "غير مصرح"}), 401
+        s["lastSeen"] = now_ms()
+        sessions[token] = s
+        write_json(SESSIONS_FILE, sessions)
+        request.spider_session = s
+        return f(*args, **kwargs)
+    return wrapper
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip()
+    fingerprint = data.get("fingerprint") or request.remote_addr or ""
+
+    if not code:
+        return jsonify({"status": "error", "error": "الرجاء إدخال الكود"}), 400
+
+    codes = read_json(CODES_FILE, {})
+    entry = codes.get(code)
+
+    if not entry:
+        return jsonify({"status": "error", "error": "كود غير صالح"}), 401
+
+    if entry.get("revoked"):
+        return jsonify({"status": "error", "error": "تم إلغاء هذا الكود"}), 401
+
+    if entry.get("expires", 0) < now_ms():
+        return jsonify({"status": "error", "error": "انتهت صلاحية الكود"}), 401
+
+    if entry.get("uses", 0) >= entry.get("maxUses", 1):
+        return jsonify({"status": "error", "error": "تم استنفاد استخدامات الكود"}), 401
+
+    if not entry.get("boundTo"):
+        entry["boundTo"] = fingerprint
+        entry["boundAt"] = now_ms()
+    elif entry["boundTo"] != fingerprint:
+        return jsonify({"status": "error", "error": "هذا الكود مستخدم على جهاز آخر"}), 401
+
+    entry["uses"] = entry.get("uses", 0) + 1
+    entry["lastUsed"] = now_ms()
+    codes[code] = entry
+    write_json(CODES_FILE, codes)
+
+    token = secrets.token_hex(32)
+    sessions = read_json(SESSIONS_FILE, {})
+    sessions[token] = {
+        "code": code,
+        "ip": request.remote_addr,
+        "created": now_ms(),
+        "expires": entry["expires"],
+        "lastSeen": now_ms(),
+    }
+    write_json(SESSIONS_FILE, sessions)
+
+    log.info(f"[دخول] كود={code} ip={request.remote_addr} استخدامات={entry['uses']}/{entry['maxUses']}")
+
+    return jsonify({
+        "status": "ok",
+        "token": token,
+        "developer": CONFIG["DEVELOPER"],
+        "remainingUses": entry["maxUses"] - entry["uses"],
+    })
+
+@app.route("/api/verify")
+def api_verify():
+    token = request.headers.get("x-session") or request.args.get("token")
+    sessions = read_json(SESSIONS_FILE, {})
+    s = sessions.get(token)
+    if not s or s.get("expires", 0) < now_ms():
+        return jsonify({"status": "error"}), 401
+    return jsonify({"status": "ok", "developer": CONFIG["DEVELOPER"]})
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    token = request.headers.get("x-session") or (request.get_json(silent=True) or {}).get("token")
+    sessions = read_json(SESSIONS_FILE, {})
+    if token in sessions:
+        del sessions[token]
+        write_json(SESSIONS_FILE, sessions)
+    return jsonify({"status": "ok"})
+
+@app.route("/api/stats")
+@require_session
+def api_stats():
+    return jsonify({
+        "developer": CONFIG["DEVELOPER"],
+        "total_accounts": 0,
+        "accounts": [],
+        "logs": [],
+        "total_matches": 0,
+        "total_matches_started": 0,
+        "total_active_matches": 0,
+        "total_gained_exp": 0,
+        "exp_per_hour": 0,
+        "uptime": int(time.time() - START_TIME),
+    })
+
+# ============================================================
+# إنشاء كود
+# ============================================================
+def create_code(max_uses=1, days=7, owner=None, package=None):
+    code = gen_code()
+    codes = read_json(CODES_FILE, {})
+    codes[code] = {
+        "code": code,
+        "uses": 0,
+        "maxUses": max_uses,
+        "expires": now_ms() + days * 24 * 3600 * 1000,
+        "created": now_ms(),
+        "owner": owner,
+        "package": package,
+        "boundTo": None,
+        "revoked": False,
+    }
+    write_json(CODES_FILE, codes)
+    return code
+
+# ============================================================
+# بوت تلجرام — أوامر عربية
+# ============================================================
+# ============================================================
+# بوت تلجرام — أزرار كاملة + حماية الأدمن
+# ============================================================
+
+def is_admin(update_or_chat_id) -> bool:
+    """التحقق إن المستخدم أدمن"""
+    if hasattr(update_or_chat_id, "effective_chat"):
+        return update_or_chat_id.effective_chat.id == CONFIG["ADMIN_CHAT_ID"]
+    return update_or_chat_id == CONFIG["ADMIN_CHAT_ID"]
+
+
+def kb_main_menu():
+    """القائمة الرئيسية للمستخدم"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 شراء كود دخول", callback_data="shop")],
+        [InlineKeyboardButton("📖 المساعدة", callback_data="help_user")],
+    ])
+
+
+def kb_admin_panel():
+    """لوحة التحكم للأدمن"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎟️ توليد كود جديد", callback_data="admin_gencode")],
+        [InlineKeyboardButton("📋 الأكواد النشطة", callback_data="admin_codes")],
+        [InlineKeyboardButton("💰 تقرير المبيعات", callback_data="admin_sales")],
+        [InlineKeyboardButton("📊 إحصائيات النظام", callback_data="admin_stats")],
+        [InlineKeyboardButton("👥 الجلسات النشطة", callback_data="admin_sessions")],
+        [InlineKeyboardButton("🔒 إلغاء كود", callback_data="admin_revoke_menu")],
+    ])
+
+
+def kb_back_menu(is_admin_menu=False):
+    """زر الرجوع"""
+    target = "admin_panel" if is_admin_menu else "back_main"
+    label = "🔙 رجوع للوحة التحكم" if is_admin_menu else "🔙 رجوع"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
+
+
+def kb_shop():
+    """قائمة الباقات"""
+    rows = []
+    for key, pkg in CONFIG["PACKAGES"].items():
+        rows.append([InlineKeyboardButton(
+            f"{pkg['name']} — {pkg['stars']} ⭐ ({pkg['days']} يوم)",
+            callback_data=f"buy:{key}"
+        )])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# /start
+# ============================================================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if is_admin(chat_id):
+        await update.message.reply_text(
+            f"👋 <b>أهلاً بك يا أدمن</b>\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>\n\n"
+            f"اختر من الأزرار أدناه:",
+            parse_mode="HTML",
+            reply_markup=kb_admin_panel()
+        )
+    else:
+        await update.message.reply_text(
+            f"👋 <b>أهلاً بك في SPIDER</b>\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>\n\n"
+            f"اختر من الأزرار أدناه:",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu()
+        )
+
+
+# ============================================================
+# معالج الأزرار الموحد
+# ============================================================
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    chat_id = q.message.chat.id
+    admin = is_admin(chat_id)
+
+    # --- أزرار المستخدم ---
+    if data == "back_main":
+        await q.edit_message_text(
+            f"👋 <b>أهلاً بك في SPIDER</b>\n👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>\n\nاختر من الأزرار أدناه:",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu()
+        )
+        return
+
+    if data == "help_user":
+        await q.edit_message_text(
+            f"📖 <b>كيف تشتري كود؟</b>\n\n"
+            f"1️⃣ اضغط <b>🛒 شراء كود دخول</b>\n"
+            f"2️⃣ اختر الباقة\n"
+            f"3️⃣ ادفع بالنجوم ⭐\n"
+            f"4️⃣ سيصلك الكود هنا\n"
+            f"5️⃣ اذهب للموقع وأدخل الكود\n\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(False)
+        )
+        return
+
+    if data == "shop":
+        await q.edit_message_text(
+            f"🛒 <b>اختر الباقة المناسبة:</b>\n\n"
+            f"الدفع يتم عبر <b>نجوم تلجرام</b> ⭐\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_shop()
+        )
+        return
+
+    if data.startswith("buy:"):
+        key = data.split(":", 1)[1]
+        pkg = CONFIG["PACKAGES"].get(key)
+        if not pkg:
+            await q.edit_message_text("❌ الباقة غير موجودة", reply_markup=kb_back_menu(False))
+            return
+
+        await ctx.bot.send_invoice(
+            chat_id=chat_id,
+            title=pkg["name"],
+            description=pkg["desc"],
+            payload=f"pkg:{key}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=pkg["name"], amount=pkg["stars"])],
+        )
+        await q.answer("💳 جارٍ فتح الدفع...", show_alert=False)
+        return
+
+    # --- حماية: كل الأزرار اللي تحت دي للأدمن فقط ---
+    if not admin:
+        await q.edit_message_text(
+            f"⛔ <b>غير مصرح</b>\n\n"
+            f"هذا الزر مخصص للأدمن فقط.\n"
+            f"معرفك: <code>{chat_id}</code>",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu()
+        )
+        return
+
+    # --- أزرار الأدمن ---
+    if data == "admin_panel":
+        await q.edit_message_text(
+            f"👋 <b>لوحة التحكم</b>\n👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>\n\nاختر:",
+            parse_mode="HTML",
+            reply_markup=kb_admin_panel()
+        )
+        return
+
+    if data == "admin_gencode":
+        # طلب إعدادات الكود
+        await q.edit_message_text(
+            f"🎟️ <b>توليد كود جديد</b>\n\n"
+            f"اختر نوع الكود:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ كود سريع (استخدام 1، 7 أيام)", callback_data="gencode:1:7")],
+                [InlineKeyboardButton("📅 أسبوعي (1 استخدام، 7 أيام)", callback_data="gencode:1:7")],
+                [InlineKeyboardButton("📆 شهري (1 استخدام، 30 يوم)", callback_data="gencode:1:30")],
+                [InlineKeyboardButton("📅 3 شهور (1 استخدام، 90 يوم)", callback_data="gencode:1:90")],
+                [InlineKeyboardButton("👥 فريق (4 استخدامات، 30 يوم)", callback_data="gencode:4:30")],
+                [InlineKeyboardButton("✏️ مخصص...", callback_data="gencode:custom")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")],
+            ])
+        )
+        return
+
+    if data.startswith("gencode:"):
+        parts = data.split(":")
+        if parts[1] == "custom":
+            await q.edit_message_text(
+                f"✏️ <b>كود مخصص</b>\n\n"
+                f"ابعت الأمر التالي في الشات:\n"
+                f"<code>/gencode [عدد الاستخدامات] [عدد الأيام]</code>\n\n"
+                f"مثال: <code>/gencode 5 30</code>\n"
+                f"(5 استخدامات، 30 يوم)",
+                parse_mode="HTML",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+
+        uses = int(parts[1])
+        days = int(parts[2])
+        code = create_code(max_uses=uses, days=days, owner="admin")
+
+        await q.edit_message_text(
+            f"✅ <b>تم توليد الكود</b>\n\n"
+            f"<code>{code}</code>\n\n"
+            f"📊 الاستخدامات: <b>{uses}</b>\n"
+            f"⏱️ الصلاحية: <b>{days} يوم</b>\n\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 توليد آخر", callback_data="admin_gencode")],
+                [InlineKeyboardButton("🔙 لوحة التحكم", callback_data="admin_panel")],
+            ])
+        )
+        return
+
+    if data == "admin_codes":
+        codes = read_json(CODES_FILE, {})
+        active = [c for c in codes.values() if not c.get("revoked") and c["expires"] > now_ms() and c["uses"] < c["maxUses"]]
+
+        if not active:
+            await q.edit_message_text(
+                f"📭 <b>لا توجد أكواد نشطة</b>",
+                parse_mode="HTML",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+
+        lines = [f"📋 <b>الأكواد النشطة ({len(active)}):</b>\n"]
+        for c in active[-15:]:
+            d = time.strftime("%Y-%m-%d", time.localtime(c["expires"] / 1000))
+            lines.append(f"<code>{c['code']}</code>\n  └ {c['uses']}/{c['maxUses']} استخدام — ينتهي {d}")
+
+        await q.edit_message_text(
+            "\n\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(True)
+        )
+        return
+
+    if data == "admin_sales":
+        sales = read_json(SALES_FILE, [])
+        if not sales:
+            await q.edit_message_text(
+                f"📭 <b>لا توجد مبيعات بعد</b>",
+                parse_mode="HTML",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+
+        total_stars = sum(s["stars"] for s in sales)
+        lines = [
+            f"💰 <b>تقرير المبيعات</b>\n",
+            f"📊 إجمالي المبيعات: <b>{len(sales)}</b>",
+            f"⭐ إجمالي النجوم: <b>{total_stars}</b>\n",
+            f"<b>آخر 10 عمليات:</b>\n",
+        ]
+        for s in sales[-10:]:
+            pkg_name = CONFIG["PACKAGES"].get(s["package"], {}).get("name", s["package"])
+            uname = s.get("username") or s["user_id"]
+            lines.append(f"• {pkg_name} — {s['stars']}⭐ — @{uname}")
+
+        await q.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(True)
+        )
+        return
+
+    if data == "admin_stats":
+        codes = read_json(CODES_FILE, {})
+        sales = read_json(SALES_FILE, [])
+        sessions = read_json(SESSIONS_FILE, {})
+        active_codes = len([c for c in codes.values() if not c.get("revoked") and c["expires"] > now_ms() and c["uses"] < c["maxUses"]])
+        active_sess = len([s for s in sessions.values() if s["expires"] > now_ms()])
+        total_stars = sum(s["stars"] for s in sales)
+        uptime = int(time.time() - START_TIME)
+
+        await q.edit_message_text(
+            f"📊 <b>إحصائيات النظام</b>\n\n"
+            f"🎟️ أكواد نشطة: <b>{active_codes}</b>\n"
+            f"🔓 جلسات نشطة: <b>{active_sess}</b>\n"
+            f"💰 مبيعات: <b>{len(sales)}</b>\n"
+            f"⭐ إجمالي النجوم: <b>{total_stars}</b>\n"
+            f"⏱️ مدة التشغيل: <b>{uptime // 60} دقيقة</b>\n\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(True)
+        )
+        return
+
+    if data == "admin_sessions":
+        sessions = read_json(SESSIONS_FILE, {})
+        active = [s for s in sessions.values() if s["expires"] > now_ms()]
+
+        if not active:
+            await q.edit_message_text(
+                f"📭 <b>لا توجد جلسات نشطة</b>",
+                parse_mode="HTML",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+
+        lines = [f"👥 <b>الجلسات النشطة ({len(active)}):</b>\n"]
+        for s in active[-10:]:
+            t = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["created"] / 1000))
+            lines.append(f"🎟️ <code>{s['code'][:20]}</code>\n  └ IP: {s.get('ip', '—')}\n  └ آخر ظهور: {t}")
+
+        await q.edit_message_text(
+            "\n\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(True)
+        )
+        return
+
+    if data == "admin_revoke_menu":
+        codes = read_json(CODES_FILE, {})
+        active = [c for c in codes.values() if not c.get("revoked") and c["expires"] > now_ms()]
+
+        if not active:
+            await q.edit_message_text(
+                f"📭 <b>لا توجد أكواد لإلغائها</b>",
+                parse_mode="HTML",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+
+        rows = []
+        for c in active[-10:]:
+            rows.append([InlineKeyboardButton(
+                f"🔒 {c['code'][:24]}...",
+                callback_data=f"revoke:{c['code']}"
+            )])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+
+        await q.edit_message_text(
+            f"🔒 <b>اختر كود لإلغائه:</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    if data.startswith("revoke:"):
+        code = data.split(":", 1)[1]
+        codes = read_json(CODES_FILE, {})
+        if code not in codes:
+            await q.edit_message_text(
+                f"❌ الكود غير موجود",
+                reply_markup=kb_back_menu(True)
+            )
+            return
+        codes[code]["revoked"] = True
+        write_json(CODES_FILE, codes)
+        await q.edit_message_text(
+            f"✅ <b>تم إلغاء الكود</b>\n\n"
+            f"<code>{code}</code>\n\n"
+            f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_back_menu(True)
+        )
+        return
+
+    # لو الزر مش معروف
+    await q.edit_message_text(
+        f"❓ زر غير معروف",
+        reply_markup=kb_admin_panel() if admin else kb_main_menu()
+    )
+
+
+# ============================================================
+# دفع
+# ============================================================
+async def on_precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.pre_checkout_query
+    await q.answer(ok=True)
+
+
+async def on_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    payload = msg.successful_payment.invoice_payload
+    key = payload.split(":", 1)[1]
+    pkg = CONFIG["PACKAGES"].get(key)
+    if not pkg:
+        return
+
+    user = msg.from_user
+    code = create_code(
+        max_uses=pkg["uses"],
+        days=pkg["days"],
+        owner=user.id,
+        package=key
+    )
+
+    sales = read_json(SALES_FILE, [])
+    sales.append({
+        "user_id": user.id,
+        "username": user.username,
+        "code": code,
+        "package": key,
+        "stars": pkg["stars"],
+        "time": now_ms(),
+    })
+    write_json(SALES_FILE, sales)
+
+    await msg.reply_text(
+        f"✅ <b>تم الدفع بنجاح!</b>\n\n"
+        f"🎟️ كود الدخول الخاص بك:\n"
+        f"<code>{code}</code>\n\n"
+        f"📊 عدد الاستخدامات: <b>{pkg['uses']}</b>\n"
+        f"⏱️ صالح لمدة: <b>{pkg['days']} يوم</b>\n\n"
+        f"➡️ اذهب إلى الموقع وأدخل هذا الكود.\n"
+        f"👨‍💻 المطور: <b>{CONFIG['DEVELOPER']}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_main_menu()
+    )
+
+    try:
+        await ctx.bot.send_message(
+            CONFIG["ADMIN_CHAT_ID"],
+            f"💰 <b>عملية بيع جديدة!</b>\n"
+            f"👤 المستخدم: @{user.username or user.id}\n"
+            f"📦 الباقة: {pkg['name']}\n"
+            f"⭐ النجوم: {pkg['stars']}\n"
+            f"🎟️ الكود: <code>{code}</code>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# أوامر الأدمن النصية (اختيارية للاستخدام السريع)
+# ============================================================
+async def cmd_gencode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text(
+            f"⛔ <b>غير مصرح</b>\n\nمعرفك: <code>{update.effective_chat.id}</code>\n\n"
+            f"استخدم <b>/start</b> لرؤية الأزرار.",
+            parse_mode="HTML"
+        )
+        return
+    args = ctx.args or []
+    uses = int(args[0]) if len(args) > 0 and args[0].isdigit() else CONFIG["DEFAULT_MAX_USES"]
+    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else CONFIG["DEFAULT_TTL_DAYS"]
+    code = create_code(max_uses=uses, days=days, owner="admin")
+    await update.message.reply_text(
+        f"🎟️ <b>كود جديد</b>\n\n<code>{code}</code>\n\n"
+        f"📊 الاستخدامات: <b>{uses}</b>\n⏱️ الأيام: <b>{days}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_panel()
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text(
+            f"👋 <b>لوحة التحكم</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_panel()
+        )
+    else:
+        await update.message.reply_text(
+            f"👋 <b>أهلاً بك في SPIDER</b>",
+            parse_mode="HTML",
+            reply_markup=kb_main_menu()
+        )
+# ============================================================
+# خدمة index.html
+# ============================================================
+@app.route("/")
+def index():
+    p = CONFIG["PUBLIC_DIR"] / "index.html"
+    if p.exists():
+        return send_from_directory(CONFIG["PUBLIC_DIR"], "index.html")
+    return "<h1>SPIDER — ضع ملف index.html في مجلد /public</h1>"
+
+# ============================================================
+# تشغيل البوت + السيرفر
+# ============================================================
+def run_telegram_bot():
+    if CONFIG["BOT_TOKEN"].startswith("7123"):
+        log.warning("[تلجرام] توكن البوت غير معدّ — البوت معطّل")
+        return
+
+    application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
+
+    # أوامر
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("help", cmd_help))
+application.add_handler(CommandHandler("gencode", cmd_gencode))
+
+# معالج كل الأزرار في دالة واحدة
+application.add_handler(CallbackQueryHandler(on_button))
+
+# الدفع
+application.add_handler(PreCheckoutQueryHandler(on_precheckout))
+application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+
+    log.info("[تلجرام] جارٍ تشغيل البوت...")
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
+    except Exception as e:
+        log.error(f"[تلجرام] خطأ: {e}")
+
+if __name__ == "__main__":
+    # Flask في thread منفصل
+    def run_flask():
+        log.info(f"🚀 SPIDER يعمل على http://localhost:{CONFIG['PORT']}")
+        log.info(f"👨‍💻 المطور: {CONFIG['DEVELOPER']}")
+        app.run(host="0.0.0.0", port=CONFIG["PORT"], debug=False, use_reloader=False)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # البوت في الـ main thread (لازم)
+    import time as _t
+    _t.sleep(1)  # نستنى Flask يقوم الأول
+    run_telegram_bot()
